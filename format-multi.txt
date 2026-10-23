@@ -1,0 +1,168 @@
+### save as a .sh file This will all you to format the drives ###
+#!/usr/bin/env bash
+# Format existing SCSI drives to 512-byte blocks with background tracking and queueing
+set -euo pipefail
+
+# 1. Configuration and Tracking Directories
+STATE_DIR="/tmp/sg_format_tracker"
+mkdir -p "$STATE_DIR"
+
+declare -A EXCLUSIONS=( ["sda"]=1 ["sdb"]=1 ["sdc"]=1 )
+
+# 2. Helper Functions
+get_available_drives() {
+    local available=()
+    for dev_path in /sys/block/sd*; do
+        [ -e "$dev_path" ] || continue
+        local d
+        d=$(basename "$dev_path")
+        local dev="/dev/$d"
+
+        # Skip manual exclusions
+        if [[ -v EXCLUSIONS[$d] ]]; then continue; fi
+
+        # Skip actively mounted drives
+        if grep -q "^$dev" /proc/mounts; then continue; fi
+
+        # Skip drives that are already actively formatting
+        if [ -f "$STATE_DIR/${d}.pid" ]; then
+            local active_pid
+            active_pid=$(cat "$STATE_DIR/${d}.pid")
+            if kill -0 "$active_pid" 2>/dev/null; then
+                continue
+            fi
+        fi
+        available+=("$d")
+    done
+    echo "${available[@]}"
+}
+
+check_active_jobs() {
+    local active=()
+    for pid_file in "$STATE_DIR"/*.pid; do
+        [ -e "$pid_file" ] || continue
+        local d
+        d=$(basename "$pid_file" .pid)
+        local active_pid
+        active_pid=$(cat "$pid_file")
+        if kill -0 "$active_pid" 2>/dev/null; then
+            active+=("$d")
+        else
+            # Clean up stale PID file if process died while script wasn't running
+            rm -f "$pid_file"
+        fi
+    done
+    echo "${active[@]}"
+}
+
+# 3. Prerequisites Check
+if ! command -v sg_format &> /dev/null; then
+    echo "Error: sg_format is not installed." >&2
+    exit 1
+fi
+
+# 4. Handle Running Jobs and Menu Selection
+active_drives=($(check_active_jobs))
+if [ ${#active_drives[@]} -gt 0 ]; then
+    echo "=== Active Background Tasks ==="
+    echo "The following drives are currently formatting: ${active_drives[*]}"
+    echo "------------------------------------------------"
+fi
+
+available_drives=($(get_available_drives))
+if [ ${#available_drives[@]} -eq 0 ]; then
+    echo "No new target drives available to format. Exiting."
+    exit 0
+fi
+
+echo "=== Available Target Drives ==="
+for i in "${!available_drives[@]}"; do
+    echo "[$i] /dev/${available_drives[$i]}"
+done
+
+read -rp "Select drive indices to format (space-separated, e.g., '0 2 3' or 'all'): " selection
+
+selected_drives=()
+if [[ "$selection" == "all" ]]; then
+    selected_drives=("${available_drives[@]}")
+else
+    for idx in $selection; do
+        if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -lt "${#available_drives[@]}" ]; then
+            selected_drives+=("${available_drives[$idx]}")
+        else
+            echo "Warning: Invalid index '$idx' skipped."
+        fi
+    done
+fi
+
+if [ ${#selected_drives[@]} -eq 0 ]; then
+    echo "No valid drives selected. Exiting."
+    exit 0
+fi
+
+# 5. Safety Confirmation
+echo -e "\nSelected drives to format: ${selected_drives[*]}"
+echo "WARNING: This will format ${#selected_drives[@]} drives in PARALLEL to 512-byte size."
+read -rp "Are you sure you want to continue? (y/N): " response
+case "$response" in
+    [yY][eE][sS]|[yY]) echo "Spawning parallel formatting processes..." ;;
+    *) echo "Aborted."; exit 0 ;;
+esac
+
+# 6. Spawn Background Formatting and Progress Logs
+for d in "${selected_drives[@]}"; do
+    dev="/dev/$d"
+    if [ ! -b "$dev" ]; then
+        echo "Skipping $dev: Not a valid block device."
+        continue
+    fi
+
+    echo "[Spawned] Formatting $dev in background..."
+    
+    # Run the utility directly into the background, saving its true PID
+    sudo sg_format --format --size=512 --fmtpinfo=0 "$dev" > "${d}_format.log" 2>&1 &
+    bg_pid=$!
+    
+    # Store PID tracking state to persistent temp files
+    echo "$bg_pid" > "$STATE_DIR/${d}.pid"
+done
+
+# 7. Dynamic Progress Monitoring Loop
+echo -e "\nMonitoring progress of ALL running formatting jobs... (Press Ctrl+C to safely exit view, jobs will keep running)"
+while true; do
+    all_jobs=("$STATE_DIR"/*.pid)
+    # Check if files actually exist
+    if [ ! -e "${all_jobs[0]}" ]; then
+        echo "All formatting jobs completed."
+        break
+    fi
+
+    still_running=0
+    clear || printf "\033c" # Refresh screen for cleaner dashboard viewing
+    echo "=== Formatting Progress Dashboard ==="
+    echo "---------------------------------------------------------"
+
+    for pid_file in "$STATE_DIR"/*.pid; do
+        [ -e "$pid_file" ] || continue
+        d=$(basename "$pid_file" .pid)
+        job_pid=$(cat "$pid_file")
+
+        if kill -0 "$job_pid" 2>/dev/null; then
+            still_running=$((still_running + 1))
+            # Extract standard progress line from log if outputted by sg_format
+            progress_line=$(tail -n 10 "${d}_format.log" | grep -i -E "progress|%|format" | tail -n 1 || echo "Initializing / Formatting...")
+            printf "%-10s [PID: %-6s]: %s\n" "/dev/$d" "$job_pid" "$progress_line"
+        else
+            # Process finished. Check exit status if logged or just mark completed
+            wait "$job_pid" 2>/dev/null && status="SUCCESS" || status="FAILED (Check ${d}_format.log)"
+            echo "/dev/$d - COMPLETED: $status"
+            rm -f "$pid_file"
+        fi
+    done
+    echo "---------------------------------------------------------"
+    
+    if [ "$still_running" -eq 0 ]; then
+        break
+    fi
+    sleep 5
+done
